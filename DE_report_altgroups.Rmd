@@ -1,13 +1,15 @@
 ---
 title: "R Notebook"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 ```{r, include = FALSE}
 knitr::opts_chunk$set(echo = FALSE)
 ```
 
-```{r, warning = FALSE, message = FALSE}
+```{r}
 #install.packages(c("ggrepel", "dplyr", "gridExtra", "grid", "lattice", "ggpubr", "umap", "ggfortify", "magick", "BiocManager", "readxl", "rmarkdown", "tibble", "rlist"))
 #BiocManager::install(c('DESeq2', 'ComplexHeatmap', 'biomaRt', 'fgsea', 'msigdbr'))
 
@@ -32,6 +34,7 @@ library(ggfortify)
 library(magick)
 library(tibble)
 library(rlist)
+library(outliers)
 ```
 
 ```{r}
@@ -53,11 +56,26 @@ library(rlist)
 count_data = readRDS('data/Raw_RNASeq_Data.RDS')
 ens2gene = readRDS("data/ens2gene.RDS")
 meta_data = data.frame(read.csv('data/COVIRS_metadata.csv', header = TRUE))
+```
+
+
+### 0. Introduction
+The COVIRS dataset allows a complex, deep analysis of vaccine response. [Ryan et al. (2022)](<https://www.medrxiv.org/content/10.1101/2022.09.22.22280180v1>) found a few variables associated with individual symptoms (e.g., lower TFNa and chills after second dose of Pfizer), but only tested presence/absence of individual symptoms for associations.
+
+Here, I sought to take this line of thinking further by finding groups of participants based on all symptoms, comparing gene expression between the two groups after the second dose of Pfizer (V2), and seeing if any differences can be detected between the same groups at V0 (i.e., before vaccination).
+
+Briefly, two groups were identified - symptomatic and asymptomatic. At V2, no important expression differences were found at the per-gene level, but GSEA identified cell signature differences (blood transcriptional modules from [Li et al. (2014)](<https://pubmed.ncbi.nlm.nih.gov/24336226/>)), and a lower B cell count in the symptomatic group was confirmed by flow cytometry. At V0, cell composition differences were unclear, but a few individual genes were significantly differentially expressed, including RNU1-4, an snRNA with unclear function that was overexpressed in the asymptomatic group.
+
+
+### 1. Defining patient groups based on symptoms
+Data from Pfizer-vaccinated participants only (i.e., first and second dose) was used in this analysis due to the greater abundance and variety of V2 symptoms, and due to the small number of AstraZeneca-vaccinated participants.
+
+```{r, echo = TRUE}
 meta_data = meta_data[meta_data$Timepoint == 'V2A' & meta_data$First.Second.vaccine == 'BNT162b2', ]
 ```
 
 
-### 1. Defining patient groups based on symptoms
+A heatmap is convenient to visualise and cluster this kind of binary data on many variables. We can see that there are broadly two groups of participants - those with V2 fatigue, headache, myalgia, and chills (right half), and those without (left half). And yes, the Third.vaccine annotation shows that, indeed, the future does not affect the past. 
 
 ```{r}
 plot = data.frame(subset(meta_data, select = -c(id, Participant.ID, Run, SAGC_ID, First.Second.vaccine, Third.vaccine, Sex, Timepoint)))
@@ -66,6 +84,9 @@ ha_participants = HeatmapAnnotation(df = meta_data[ ,c('Third.vaccine', 'Sex')],
 Heatmap(as.matrix(t(plot)), show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = col_dend, show_row_dend = FALSE, top_annotation = ha_participants, show_heatmap_legend = FALSE, col = c('lightgrey', 'firebrick3'), column_title = 'COVIRS participant and symptom clusters')
 rm(plot); rm(ha_participants); rm(col_dend);
 ```
+
+
+The below two plots are a UMAP of participants by symptoms (each point represents one person). We can see that there are two clusters within the emerging symptomatic group, possibly differing in presence (top cluster) or absence (bottom cluster) of fever and nausea in addition to the other systemic symptoms at V2. This heterogeneity was not accounted for due to the low sample size and hence low power to determine such fine structure in the data. 
 
 ```{r}
 custom.config = umap.defaults
@@ -92,6 +113,9 @@ ggplot(plot, aes(x = UMAP1, y = UMAP2, fill = Sex, label = apply(subset(plot, se
   ggtitle('UMAP of Pfizer-vaccinated participants by symptoms', subtitle = 'Labels are total of V2 fatigue, headache, myalgya, and chills'); rm (plot)
 ```
 
+
+Running UMAP on the transpose of the matrix used to make the above plots gives the below plot, where each point is a symptom. Immediately, we can see that local symptoms (pain, tenderness, and possibly redness/swelling/itchiness) cluster strongly together and separately from the other, systemic symptoms. Note that fever and nausea cluster together with the other systemic symptoms, hence supporting our decision to ignore the suspected heterogeneity discussed above.
+
 ```{r}
 plot = data.frame(t(subset(meta_data, select = -c(id, Participant.ID, Run, SAGC_ID, Timepoint, First.Second.vaccine, Third.vaccine, Sex))))
 umap = umap(as.matrix(apply(plot, 2, as.numeric)), config = custom.config); umap = data.frame(umap$layout)
@@ -102,19 +126,117 @@ ggplot(plot, aes(x = UMAP1, y = UMAP2, label = Symptom, fill = Timepoint)) + geo
 rm(custom.config); rm(plot)
 ```
 
-Groups: severe V2 symptoms vs no severe V2 symptoms, possible internal heterogeneity in symptomatic group by fever + nausea (changing numbers on participant UMAP), not supported by symptom UMAP
 
+Finally, we can define comparison groups for DE analysis. Having 3 or more of V2 Fatigue, Headache, Myalgia, Chills, Fever, or Nausea (systemic symptoms) defines the symptomatic group. Having no V2 systemic symptoms and 2 or less of V2 Pain, Tenderness, or Redness/swelling/itchiness defines the asymptomatic group. There is an obvious bias towards females in these groups, but the distribution of males was deemed to be equal between the two. 
 
-```{r}
+```{r, echo = TRUE}
 test = meta_data[apply(subset(meta_data, select = c(V2_Fatigue, V2_Headache, V2_Myalgia, V2_Chills, V2_Fever, V2_Nausea)) == 1, 1, sum) >= 3, ]; test$Group = "Symptomatic"
 control = subset(meta_data[apply(meta_data[, 18:ncol(meta_data)] == 1, 1, sum) <= 2, ], V2_Fatigue == 0 & V2_Myalgia == 0 & V2_Chills == 0 & V2_Headache == 0 & V2_Fever == 0 & V2_Nausea == 0); control$Group = "Asymptomatic"
+```
 
+```{r}
 meta_data = rbind(test, control); rm(test); rm(control)
 count_data = count_data[, colnames(count_data) %in% meta_data$id]; meta_data = meta_data[order(meta_data$id), ]
 count_data = count_data[, order(colnames(count_data))]; count_data = count_data[rownames(ens2gene), ]
 count_data = data.frame(cbind(ensgene = rownames(count_data), count_data))
 rownames(count_data) = NULL; rownames(meta_data) = NULL
 ```
+
+```{r}
+plot = as.matrix(meta_data[, 10:ncol(meta_data) - 1])
+ha_participants = HeatmapAnnotation(df = meta_data[, c('Third.vaccine', 'Sex', 'Group')], col = list(Group = c('Asymptomatic' = 'chocolate3', 'Symptomatic' = 'darkgoldenrod2'), Third.vaccine = c('mRNA-1273' = 'darkcyan', 'BNT162b2' = 'darkorchid4', 'Missing' = 'darkolivegreen'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
+Heatmap(t(plot), column_split = meta_data$Group, row_order = c("V1_Tenderness", "V1_Pain", "V1_Redness_Swelling_Itchiness", "V1_Fatigue", "V1_Headache", "V1_Myalgia", "V1_Chills", "V1_Fever", "V1_Nausea", "V2_Tenderness", "V2_Pain", "V2_Redness_Swelling_Itchiness", "V2_Fatigue", "V2_Headache", "V2_Myalgia", "V2_Chills", "V2_Fever", "V2_Nausea"), cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_dend_side = 'top', col = c('lightgrey', 'firebrick3'), top_annotation = ha_participants, show_column_names = FALSE, show_heatmap_legend = FALSE, row_split = grepl('V2_', rownames(t(plot))), row_title = NULL, column_title = 'Groups defined for DE analysis:\nsymptomatic and asymptomatic'); rm(plot)
+```
+
+
+### 2. Antibodies and T cell responses
+Another important motivator for this study is that the groups do not differ significantly in COVID antibody titres or T cell responses. The symptoms observed do not correlate with common measures of vaccince effectiveness. Hence, their cause and relationship to protection (or lack of it) should be looked into.
+
+```{r}
+antibody_data = read.csv('data/antibodies.csv')
+antibody_data = subset(antibody_data, Patient %in% meta_data$Participant.ID); meta_anti = meta_data[meta_data$Participant.ID %in% antibody_data$Patient, ]; antibody_data$Group = meta_anti$Group; rm(meta_anti)
+```
+
+```{r}
+ggboxplot(antibody_data, x = 'Group', y = 'Titre', add = 'jitter', facet.by = 'Antibody.type') + stat_compare_means(label = "p.format") + xlab('') + ggtitle('COVID antibody titres are not significantly different\nbetween symptomatic and asymptomatic groups at V2B')
+```
+
+```{r}
+tcell_data = read.csv('data/tcells.csv')
+tcell_data = subset(tcell_data, Patient_ID %in% meta_data$Participant.ID); meta_tcell = meta_data[meta_data$Participant.ID %in% tcell_data$Patient_ID, ]; tcell_data$Group = meta_tcell$Group; rm(meta_tcell); tcell_data$Value = log10(tcell_data$Value)
+```
+
+```{r}
+ggboxplot(tcell_data, x = 'Group', y = 'Value', add = 'jitter', facet.by = 'Type') + stat_compare_means(label = "p.format") + xlab('') + ggtitle('T cell responses are not significantly different\nbetween symptomatic and asymptomatic groups at V2B')
+```
+
+```{r}
+rm(antibody_data); rm(ha_participants); rm(tcell_data)
+```
+
+
+### 3. Flow cytometry
+At V2, B cell count is significantly lower in the symptomatic group. It is safe to assume that they have migrated to the spleen to complete their development, and at a higher rate in the symptomatic group.
+
+```{r}
+flow = read.csv('data/COVIRS_flow_data_20230202.csv'); flow = subset(flow, Patient %in% meta_data$Participant.ID & Timepoint == 'V2A'); meta_flow = subset(meta_data, Participant.ID %in% flow$Patient); flow = flow[order(flow$Patient), ]; flow$Total = rowSums(flow[, 5:ncol(flow)-1]); flow$Group = meta_flow$Group;
+```
+
+```{r}
+flow_log = log10(flow[, 5:ncol(flow) - 1]); flow_log$Group = meta_flow$Group
+
+plot1 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[1], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.5) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot2 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[2], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 5.75) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot3 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[3], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 6.1) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot6 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[6], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.7) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot9 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[9], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 4.6) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot11 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[11], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.75, label.y = 3.4) + xlab('') + theme(axis.text.x = element_text(size = 8))
+grid.arrange(plot1, plot2, plot3, plot6, plot9, plot11, ncol = 3, top = textGrob('Flow cytometry at V2', gp = gpar(fontface = 3)), right = textGrob('log10 counts                    log10 counts', rot = 90, gp = gpar(fontsize = 11)))
+
+plot4 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[4], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.0) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot5 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[5], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.4) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot7 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[7], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 4.0) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot8 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[8], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 3.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot10 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[10], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.1) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot12 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[12], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 3.3) + xlab('') + theme(axis.text.x = element_text(size = 8))
+grid.arrange(plot4, plot5, plot7, plot8, plot10, plot12, ncol = 3, top = textGrob('Flow cytometry at V2', gp = gpar(fontface = 3)), right = textGrob('log10 counts                    log10 counts', rot = 90, gp = gpar(fontsize = 11)))
+
+ggboxplot(flow_log, x = 'Group', y = 'Total', add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 6.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
+```
+
+```{r}
+flow = read.csv('data/COVIRS_flow_data_20230202.csv'); flow = subset(flow, Patient %in% meta_data$Participant.ID & Timepoint == 'V0'); meta_flow = subset(meta_data, Participant.ID %in% flow$Patient); flow = flow[order(flow$Patient), ]; flow$Total = rowSums(flow[, 5:ncol(flow)-1]); flow$Group = meta_flow$Group
+```
+
+```{r}
+flow_log = log10(flow[, 5:ncol(flow) - 1]); flow_log$Group = meta_flow$Group
+
+plot1 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[1], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.6) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot2 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[2], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 6.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot3 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[3], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 6.25) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot5 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[5], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot9 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[9], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.5) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot11 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[11], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.2) + xlab('') + theme(axis.text.x = element_text(size = 8))
+grid.arrange(plot1, plot2, plot3, plot5, plot9, plot11, ncol = 3, top = textGrob('Flow cytometry at V0', gp = gpar(fontface = 3)), right = textGrob('log10 counts                    log10 counts', rot = 90, gp = gpar(fontsize = 11)))
+
+plot4 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[4], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.0) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot6 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[6], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.7) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot7 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[7], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 4.0) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot8 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[8], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 3.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot10 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[10], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.1) + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot12 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[12], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 3.3) + xlab('') + theme(axis.text.x = element_text(size = 8))
+grid.arrange(plot4, plot6, plot7, plot8, plot10, plot12, ncol = 3, top = textGrob('Flow cytometry at V0', gp = gpar(fontface = 3)), right = textGrob('log10 counts                    log10 counts', rot = 90, gp = gpar(fontsize = 11)))
+
+ggboxplot(flow_log, x = 'Group', y = 'Total', add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 6.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
+```
+
+```{r}
+rm(flow); rm(meta_flow); rm(flow_log); rm(plot4); rm(plot6); rm(plot7); rm(plot8); rm(plot10); rm(plot12); rm(plot1); rm(plot2); rm(plot3); rm(plot5); rm(plot9); rm(plot11)
+```
+
+
+### 4. V2 GSEA
+Before proceeding, a quick sanity check of the data and the analysis is to plot XIST expression by sex. As expected, it is not expressed in males in our data. 
 
 ```{r, warning = FALSE}
 dds = DESeqDataSetFromMatrix(countData = count_data, 
@@ -126,56 +248,34 @@ vsd.df$Group = meta_data$Group; vsd.df$Sex = meta_data$Sex
 ggplot(vsd.df, aes(x = Sex, y = vsd.df[, 'ENSG00000229807'])) + geom_boxplot() + geom_jitter() + ylab('XIST (log2 counts per million)') + theme_classic() + xlab('') + ggtitle('QC of DE analysis data by XIST expression')
 ```
 
-```{r}
-plot = as.matrix(meta_data[, 10:ncol(meta_data) - 1])
-ha_participants = HeatmapAnnotation(df = meta_data[, c('Third.vaccine', 'Sex', 'Group')], col = list(Group = c('Asymptomatic' = 'chocolate3', 'Symptomatic' = 'darkgoldenrod2'), Third.vaccine = c('mRNA-1273' = 'darkcyan', 'BNT162b2' = 'darkorchid4', 'Missing' = 'darkolivegreen'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
-Heatmap(t(plot), column_split = meta_data$Group, row_order = c("V1_Tenderness", "V1_Pain", "V1_Redness_Swelling_Itchiness", "V1_Fatigue", "V1_Headache", "V1_Myalgia", "V1_Chills", "V1_Fever", "V1_Nausea", "V2_Tenderness", "V2_Pain", "V2_Redness_Swelling_Itchiness", "V2_Fatigue", "V2_Headache", "V2_Myalgia", "V2_Chills", "V2_Fever", "V2_Nausea"), cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_dend_side = 'top', col = c('lightgrey', 'firebrick3'), top_annotation = ha_participants, show_column_names = FALSE, show_heatmap_legend = FALSE, row_split = grepl('V2_', rownames(t(plot))), row_title = NULL, column_title = 'Groups defined for DE analysis:\nsymptomatic and asymptomatic'); rm(plot)
-```
 
-How to handle males?
-
-
-### 2. DE analysis
+Only genes with 100 read counts or more in at least 4 samples (i.e., participants) were kept from the counts matrix, and DESeq2 was used to find differences between the groups while controlling fir differences due to sex.
 
 ```{r, warning = FALSE}
 dds = DESeqDataSetFromMatrix(countData = count_data, 
                               colData = meta_data, 
                               design = ~ Group + Sex, tidy = TRUE)
-vsd = vst(dds, blind = FALSE); vsd.df = assay(vsd)
-#write.csv(vsd.df, file = 'results/counts_norm_v2.csv', row.names = TRUE)
 ```
 
 ```{r}
+vsd = vst(dds, blind = FALSE); vsd.df = assay(vsd)
+write.csv(vsd.df, file = 'results/counts_norm_v2.csv', row.names = TRUE)
+```
+
+```{r, message = FALSE, warning = FALSE, echo = TRUE}
 keep = rowSums(counts(dds)>100) >= 4; dds = dds[keep, ]; dds = DESeq(dds)
 res = results(dds, contrast = c("Group", "Symptomatic", "Asymptomatic")); res = res[order(res$padj, decreasing = FALSE), ]
-res; summary(res); res.df = data.frame(res)
-#write.csv(res.df, file = 'results/res_deseq_v2.csv', row.names = TRUE)
+res; summary(res)
+```
+
+```{r}
+res.df = data.frame(res); res.df = data.frame(res.df, ens2gene[rownames(res.df), ])
+write.csv(res.df, file = 'results/res_deseq_v2.csv', row.names = TRUE)
 rm(keep)
 ```
 
-```{r}
-plot = rbind(filter(res.df, log2FoldChange > 0)[1:3, ], filter(res.df, log2FoldChange < 0)[1:3, ])
-vsd.df = data.frame(t(vsd.df)); vsd.df$Group = meta_data$Group; vsd.df$Sex = meta_data$Sex
-res.df = data.frame(res.df, ens2gene[rownames(res.df), ])
 
-plot1 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[1]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[1], 'ensembl_gene_id']) + geom_text(aes(x = 1, y = 10.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[1], 'padj'], 4)))) + theme_classic() + xlab('')
-plot2 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[2]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[2], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[2], 'padj'], 4)))) + theme_classic() + xlab('')
-plot3 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[3]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[3], 'external_gene_name']) + geom_text(aes(x = 1, y = 7.25, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[3], 'padj'], 4)))) + theme_classic() + xlab('')
-plot4 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[4]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[4], 'external_gene_name']) + geom_text(aes(x = 2, y = 10.2, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[4], 'padj'], 4)))) + theme_classic() + xlab('')
-plot5 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[5]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[5], 'external_gene_name']) + geom_text(aes(x = 2, y = 7.25, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[5], 'padj'], 4)))) + theme_classic() + xlab('')
-plot6 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[6]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[6], 'external_gene_name']) + geom_text(aes(x = 2, y = 8.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[6], 'padj'], 4)))) + theme_classic() + xlab('')
-grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol = 3, right = textGrob('log2 counts per million              log2 counts per million', rot = 90, gp = gpar(fontsize = 11)))
-
-vsd.df$Sex = NULL; vsd.df$Group = NULL; vsd.df = data.frame(t(vsd.df))
-rm(plot); rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(plot5); rm(plot6)
-```
-
-```{r}
-ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
-zzz = t(scale(t(vsd.df[rownames(res.df[1:25, ]), ]))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-Heatmap(zzz, show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), column_title = 'Top 25 DE genes by padj, V2A', column_split = meta_data$Group)
-rm(ha_top); rm(zzz)
-```
+A few genes with positive log2FoldChange (i.e., overexpressed in the symptomatic group) are approaching significance (padj <= 0.1). Only CNOT7 has significantly lower log2FoldChange.
 
 ```{r, warning = FALSE}
 plot = subset(res.df, padj < 0.8)
@@ -184,8 +284,37 @@ ggplot(res.df, aes(x = log2FoldChange, y = -log10(padj))) + geom_point() +
   theme_classic() + geom_text_repel(max.overlaps = 13, data = subset(plot, -log10(padj) > 0.2), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + ggtitle("Volcano plot of DE genes, V2A"); rm(plot)
 ```
 
+```{r}
+plot = rbind(filter(res.df, log2FoldChange > 0)[1:4, ], filter(res.df, log2FoldChange < 0)[1:2, ])
+vsd.df = data.frame(t(vsd.df)); vsd.df$Group = meta_data$Group; vsd.df$Sex = meta_data$Sex
 
-### 3. V2 GSEA
+plot1 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[1]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[1], 'ensembl_gene_id']) + geom_text(aes(x = 1, y = 10.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[1], 'padj'], 4)))) + theme_classic() + xlab('')
+plot2 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[2]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[2], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[2], 'padj'], 4)))) + theme_classic() + xlab('')
+plot3 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[3]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[3], 'external_gene_name']) + geom_text(aes(x = 1, y = 6.9, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[3], 'padj'], 4)))) + theme_classic() + xlab('')
+plot4 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[4]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[4], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.7, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[4], 'padj'], 4)))) + theme_classic() + xlab('')
+plot5 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[5]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[5], 'external_gene_name']) + geom_text(aes(x = 2, y = 10.25, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[5], 'padj'], 4)))) + theme_classic() + xlab('')
+plot6 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[6]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[6], 'external_gene_name']) + geom_text(aes(x = 2, y = 7.1, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[6], 'padj'], 4)))) + theme_classic() + xlab('')
+grid.arrange(plot1, plot2, plot3, plot4, ncol = 2, right = textGrob('log2 counts per million              log2 counts per million', rot = 90, gp = gpar(fontsize = 11)))
+grid.arrange(plot5, plot6, ncol = 2, right = textGrob('log2 counts per million', rot = 90, gp = gpar(fontsize = 11)))
+
+vsd.df$Sex = NULL; vsd.df$Group = NULL; vsd.df = data.frame(t(vsd.df))
+rm(plot); rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(plot5); rm(plot6)
+```
+
+
+CNOT7 depletion was reported by [Ren et al. (2020)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7193174/) and [Guo et al. (2019)](https://pesquisa.bvsalud.org/portal/resource/pt/wpr-744830) to reduce TGF beta 1 production in liver cancer cells and, importantly to us, increase IFN gamma secretion by NK cells. Are these cells more active in the symptomatic participants? To answer this and other questions about the immune response, and to find expression differences in groups of genes rather than individual genes, I conducted gene set enrichment analysis.
+
+```{r}
+ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
+zzz = t(scale(t(vsd.df[rownames(res.df[1:25, ]), ]))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+Heatmap(zzz, show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), column_title = 'Top 25 DE genes by padj, V2A', column_split = meta_data$Group)
+rm(ha_top); rm(zzz)
+```
+
+
+I used [fgsea](https://bioconductor.org/packages/release/bioc/html/fgsea.html) with [MSigDB](http://www.gsea-msigdb.org/gsea/msigdb/human/collection_details.jsp) gene sets to conduct GSEA. For the symptomatic group, two differentially expressed Hallmark gene sets are of interest: an increase in the expression of heme metabolism genes, and a decrease in TNFa signalling genes. However, there is a significant decrease in B cell count in the symptomatic group, suggesting that the "enrichment" in heme metabolism genes is merely an artefact of the increased proportion of RBCs and eryhtroblasts in this group. As for TNFa signalling, scanning the Human Protein Atlas for signle-cell expression of [NFKB1](https://www.proteinatlas.org/ENSG00000109320-NFKB1/single+cell+type) and [TNF](https://www.proteinatlas.org/ENSG00000232810-TNF/single+cell+type) in B cells suggests that these proteins are not overexpressed in this cell type compared to other immune cells, and hence the decrease in TNFa pathway gene expression is likely not an artefact.
+
+An important note for interpreting volcano plots of gene sets: most of the time, individual genes are *not* differentially expressed with a sufficient padj (whose value is very low in most cases). These plots are shown to illustrate the very different shapes of the data that are nonetheless assigned similar normalised expression scores and padj values by fgsea.
 
 ```{r}
 ranks <- res.df %>% 
@@ -204,44 +333,29 @@ msigDB = by(msig.df$gene_symbol, msig.df$gs_name, function(x) as.character(x))
 names(msigDB) = gsub('HALLMARK_', '', names(msigDB))
 fgseaRes = fgsea(pathways = msigDB, stats = ranks, nproc = 1); fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = FALSE), ]
 write.csv(subset(fgseaRes, select = -c(leadingEdge)), file = 'results/fgseaRes_H_v2.csv', row.names = FALSE)
+```
 
+```{r}
 ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(padj), label = size)) +
   geom_col() + geom_text(color = 'gray20', nudge_x = ifelse(fgseaRes$NES > 0, 0.5, 3)) + 
   ylab('') + theme_classic() + ggtitle('DE Hallmark gene sets, V2A')
 plotGseaTable(msigDB[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(3, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
 ```
 
-```{r}
-res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
-ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
-plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[1, 'pathway']]]] & log2FoldChange > 0))[1:15], ]
-zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot1 = Heatmap(zzz, row_title = fgseaRes[[1, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Heme metabolism genes are turned up in symptomatics at V2A', heatmap_height = unit(8, "cm")); plot1
-
+```{r, warning = FALSE}
 res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
+ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
 plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[2, 'pathway']]]] & log2FoldChange < 0))[1:15], ]
 zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
 plot2 = Heatmap(zzz, row_title = fgseaRes[[2, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'TNFA signalling genes are turned down in symptomatics at V2A', heatmap_height = unit(8, "cm")); plot2
 
-rm(plot1); rm(plot2); rm(ha_top); rm(zzz)
+rm(plot2); rm(ha_top); rm(zzz)
 
 ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[2, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + geom_vline(xintercept = 0, linetype = 2) + ggtitle('TNFA genes at V2')
-
-ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[1, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + scale_y_continuous(position = "right")
 ```
 
-```{r}
-msig.df = as.data.frame(msigdbr(species = "Homo sapiens", category = 'C5', subcategory = "GO:BP"))
-msigDB = by(msig.df$gene_symbol, msig.df$gs_name, function(x) as.character(x))
-names(msigDB) = gsub('GOBP_', '', names(msigDB))
-fgseaRes = fgsea(pathways = msigDB, stats = ranks, nproc = 1); fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = FALSE), ]
-write.csv(subset(fgseaRes, select = -c(leadingEdge)), file = 'results/fgseaRes_C5_GOBP_v2.csv', row.names = FALSE)
 
-ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(padj), label = size)) +
-  geom_col() + geom_text(color = 'gray20', nudge_x = ifelse(fgseaRes$NES > 0, 0.5, 3)) + 
-  ylab('') + theme_classic() + ggtitle('DE GO biological processes, V2A')
-plotGseaTable(msigDB[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(7, 4, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
-```
+Next, bone marrow gene sets from [Hay et al., 2018](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6296228/) were used to find cell type signatures differentially expressed between the two groups. Once again, erythroblast genes are very strongly and confidently "turned up", likely an artifact of the increased proportion of eryhtroblasts.
 
 ```{r}
 msig.df = as.data.frame(msigdbr(species = "Homo sapiens", category = "C8")); msig.df = msig.df[grepl('HAY_BONE_MARROW', msig.df$gs_name), ]
@@ -255,12 +369,15 @@ ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(p
 plotGseaTable(msigDB[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(3, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
 ```
 
-```{r}
+
+Taken together, the three significant B cell signatures indicate more intensive B cell maturation in the symptomatic group: there is a stronger signature of early (Pre-B) cells in the blood, and a weaker blood signature of B cell stages expected to migrate into lymph. 
+
+```{r, warning = FALSE}
 res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
 ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
 plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[2, 'pathway']]]] & log2FoldChange < 0))[1:8], ]
 zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot1 = Heatmap(zzz, row_title = fgseaRes[[2, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Pro-B cell type signature is turned up in symptomatics at V2')
+plot1 = Heatmap(zzz, row_title = fgseaRes[[2, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'B cell maturation is more intensive in symptomatics at V2')
 res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
 plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[4, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
 zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
@@ -271,28 +388,55 @@ zzz = t(scale(t(plot3))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[
 plot3 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[8, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
 draw(plot1 %v% plot2 %v% plot3); rm(plot1); rm(plot2); rm(plot3); rm(zzz); rm(ha_top)
 
+ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[2, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + geom_vline(xintercept = 0, linetype = 2) + ggtitle('Follicular B cell genes at V2')
 ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[4, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + geom_vline(xintercept = 0, linetype = 2) + ggtitle('Pro-B genes at V2')
+ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[8, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + geom_vline(xintercept = 0, linetype = 2) + ggtitle('CD34+ pre-B cell genes at V2')
+```
 
+
+As expected from the significantly reduced expression of CNOT7, there is a stronger NK cell signature in the symptomatic group (i.e., the cells are more active, as the counts are not significantly different between the groups). Interestingly, the naive T cell signature is down, suggesting that T cells are also further differentiated in the symptomatic group, although there is no corresponding mature T cell signature to support this.
+
+```{r, warning = FALSE}
 res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
 ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
-plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[1, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
+plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[3, 'pathway']]]] & log2FoldChange > 0))[1:12], ]
 zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot1 = Heatmap(zzz, row_title = fgseaRes[[1, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Eryhtroblast and NK cell signature is up,\nnaive T cell signature is down in symptomatics at V2')
-plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[3, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
-zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[3, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+plot1 = Heatmap(zzz, row_title = fgseaRes[[3, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'NK cell signature is up,\nnaive T cell signature is down in symptomatics at V2') 
 res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
-plot4 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[7, 'pathway']]]] & log2FoldChange < 0))[1:8], ]
-zzz = t(scale(t(plot4))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot4 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[7, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-draw(plot1 %v% plot2 %v% plot4); rm(plot1); rm(plot2); rm(plot4); rm(zzz); rm(ha_top)
+plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[7, 'pathway']]]] & log2FoldChange < 0))[1:12], ]
+zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[7, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
+draw(plot1 %v% plot2); rm(plot1); rm(plot2); rm(zzz); rm(ha_top)
 
-ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[1, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Eryhtroblast genes at V2') + geom_vline(xintercept = 0, linetype = 2)
-ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[5, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Immature neutrophil genes at V2') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[3, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('NK genes at V2') + geom_vline(xintercept = 0, linetype = 2)
 ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[7, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Naive T cell genes at V2') + geom_vline(xintercept = 0, linetype = 2)
-
-ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[8, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('CD34+ Pre-B genes at V2') + geom_vline(xintercept = 0, linetype = 2)
 ```
+
+
+The neutrophil signatures observed above have to be treated separately. The volcano and enrichment plots below show that, unlike NK/B/T cell signatures above, the distribution of genes by padj and log2FoldChange does not convincingly agree with the NES value for these gene sets. 
+
+```{r, warning = FALSE}
+ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[5, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Immature neutrophil genes at V2') + geom_vline(xintercept = 0, linetype = 2)
+plotEnrichment(msigDB[[fgseaRes[[5, 'pathway']]]], ranks, gseaParam = 1, ticksSize = 0.2)
+
+ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[6, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Neutrophil genes at V2') + geom_vline(xintercept = 0, linetype = 2)
+plotEnrichment(msigDB[[fgseaRes[[6, 'pathway']]]], ranks, gseaParam = 1, ticksSize = 0.2)
+
+res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
+ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
+plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[5, 'pathway']]]] & log2FoldChange < 0))[1:12], ]
+zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+plot1 = Heatmap(zzz, row_title = fgseaRes[[5, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Neutrophil signature is turned down in symptomatics at V2')
+plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[6, 'pathway']]]] & log2FoldChange < 0))[1:12], ]
+zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[6, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+
+draw(plot1 %v% plot2); rm(plot1); rm(plot2); rm(zzz); rm(ha_top)
+```
+
+
+GSEA with BTMs mostly confirms these findings. B cell signature is down in the symptomatic group, agreeing with flow data, and NK cells are more active. The idea that T cells are also differentiating more intensively is supported here (enriched in T cells module). Finally, the reduced neutrophil signature is more solid with BTMs, but the reduced monocyte signature is dubious and only included for reference. 
 
 ```{r}
 btm = readRDS('data/Blood_Transcript_modules.RDS'); btm_annot = read_excel('data/btm_annotation_table.xls')
@@ -305,38 +449,41 @@ ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(p
 plotGseaTable(btm[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(6, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
 ```
 
-```{r}
+```{r, warning = FALSE}
 res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
 ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
-plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[1, 'pathway']]]] & log2FoldChange < 0))[1:13], ]
+plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[1, 'pathway']]]] & log2FoldChange < 0))[1:10], ]
 zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
 plot1 = Heatmap(zzz, row_title = fgseaRes[[1, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'B cell and neutrophil signatures\nare turned down in symptomatics at V2')
-plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[6, 'pathway']]]] & log2FoldChange < 0))[1:13], ]
+plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[6, 'pathway']]]] & log2FoldChange < 0))[1:10], ]
 zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
 plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[6, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-draw(plot1 %v% plot2)
+plot3 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[9, 'pathway']]]] & log2FoldChange < 0))[1:10], ]
+zzz = t(scale(t(plot3))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+plot3 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[9, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+draw(plot1 %v% plot2 %v% plot3)
 
 ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[1, 'pathway']]]] | external_gene_name %in% btm[[fgseaRes[[2, 'pathway']]]] | external_gene_name %in% btm[[fgseaRes[[4, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('B cell genes (M47.0, M47.1, M69) at V2') + geom_vline(xintercept = 0, linetype = 2)
 ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[6, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Neutrophil genes at V2') + geom_vline(xintercept = 0, linetype = 2)
-ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[8, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Monocyte genes at V2') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[9, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Monocyte genes at V2') + geom_vline(xintercept = 0, linetype = 2)
 
 res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
 plot4 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]] & log2FoldChange > 0))[1:15], ]
 zzz = t(scale(t(plot4))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
 plot4 = Heatmap(zzz, row_title = fgseaRes[[3, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), heatmap_height = unit(7, 'cm'), column_title = 'NK and T cell signatures are turned up in symptomatics at V2')
-plot5 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[9, 'pathway']]]] & log2FoldChange > 0))[1:12], ]
+plot5 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[8, 'pathway']]]] & log2FoldChange > 0))[1:12], ]
 zzz = t(scale(t(plot5))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot5 = Heatmap(zzz, row_title = fgseaRes[[9, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = TRUE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), show_heatmap_legend = FALSE)
+plot5 = Heatmap(zzz, row_title = fgseaRes[[8, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = TRUE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), show_heatmap_legend = FALSE)
 draw(plot4 %v% plot5)
 
-ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('NK genes at V2') + geom_vline(xintercept = 0, linetype = 2)
-ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[9, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('T genes at V2') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('NK cell genes at V2') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[8, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('T cell genes at V2') + geom_vline(xintercept = 0, linetype = 2)
 
 rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(plot5); rm(zzz); rm(ha_top)
 ```
 
 
-### 4. Repeat for V0
+### 5. V0 GSEA
 
 ```{r}
 keep = data.frame(cbind(Participant.ID = meta_data$Participant.ID, Group = meta_data$Group))
@@ -359,24 +506,33 @@ dds = DESeqDataSetFromMatrix(countData = count_data,
 vsd = vst(dds, blind = FALSE); vsd.df = assay(vsd); write.csv(vsd.df, file = 'results/counts_norm_v0.csv', row.names = TRUE)
 ```
 
-```{r}
+```{r, message = FALSE}
 keep = rowSums(counts(dds) > 100) >= 4; dds = dds[keep, ]; dds = DESeq(dds)
 res = results(dds, contrast = c("Group", "Symptomatic", "Asymptomatic")); res = res[order(res$padj, decreasing = FALSE), ]
 res; summary(res); res.df = data.frame(res); res.df = data.frame(res.df, ens2gene[rownames(res.df), ]); write.csv(res.df, file = 'results/res_deseq_v0.csv', row.names = TRUE)
 rm(keep)
 ```
 
+```{r, warning = FALSE}
+ggplot(res.df, aes(x = log2FoldChange, y = -log10(padj))) + geom_point() +
+  geom_hline(yintercept = -log10(0.1), linetype = 2) + geom_vline(xintercept = 0, linetype = 2) +
+  theme_classic() + geom_text_repel(data = subset(res.df, -log10(padj) > 1), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name), max.overlaps = 9, position = position_nudge_repel(x = 0.1, y = 0.7)) + ggtitle("Volcano plot of V0 DE genes")
+```
+
 ```{r}
-plot = rbind(filter(res.df, log2FoldChange > 0)[1:3, ], filter(res.df, log2FoldChange < 0)[1:3, ])
+plot = rbind(filter(res.df, log2FoldChange > 0)[1:6, ], filter(res.df, log2FoldChange < 0)[1:3, ])
 vsd.df = data.frame(t(vsd.df)); vsd.df$Group = meta_data$Group; vsd.df$Sex = meta_data$Sex
 
-plot1 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[1]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[1], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.2, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[1], 'padj'], 3)))) + theme_classic() + xlab('')
-plot2 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[2]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[2], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.8, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[2], 'padj'], 3)))) + theme_classic() + xlab('')
-plot3 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[3]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[3], 'external_gene_name']) + geom_text(aes(x = 1, y = 8.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[3], 'padj'], 3)))) + theme_classic() + xlab('')
-plot4 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[4]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[4], 'external_gene_name']) + geom_text(aes(x = 2, y = 9, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[4], 'padj'], 10)))) + theme_classic() + xlab('')
-plot5 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[5]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[5], 'external_gene_name']) + geom_text(aes(x = 2, y = 8, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[5], 'padj'], 3)))) + theme_classic() + xlab('')
-plot6 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[6]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[6], 'external_gene_name']) + geom_text(aes(x = 2, y = 10, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[6], 'padj'], 3)))) + theme_classic() + xlab('')
-grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol = 3, top = textGrob('   Top upturned and downturned genes at V0', gp = gpar(fontsize = 16)), right = textGrob('log2 counts per million              log2 counts per million', rot = 90, gp = gpar(fontsize = 11)))
+plot1 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[1]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[1], 'external_gene_name']) + geom_text(aes(x = 1, y = 8.9, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[1], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot2 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[2]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[2], 'external_gene_name']) + geom_text(aes(x = 2, y = 9.0, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[2], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot3 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[3]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[3], 'external_gene_name']) + geom_text(aes(x = 2, y = 7.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[3], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot4 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[4]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[4], 'external_gene_name']) + geom_text(aes(x = 1, y = 8.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[4], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot5 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[5]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[5], 'external_gene_name']) + geom_text(aes(x = 1, y = 7.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[5], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot6 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[6]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[6], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.5, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[6], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot7 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[7]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[7], 'external_gene_name']) + geom_text(aes(x = 2, y = 11, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[7], 'padj'], 10)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot8 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[8]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[8], 'external_gene_name']) + geom_text(aes(x = 2, y = 8, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[8], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+plot9 = ggplot(vsd.df, aes(x = Group, y = vsd.df[, rownames(plot)[9]])) + geom_boxplot() + geom_jitter() + ylab(res.df[rownames(plot)[9], 'external_gene_name']) + geom_text(aes(x = 1, y = 9.4, fontface = 3), label = paste0('padj = ', as.character(round(res.df[rownames(plot)[9], 'padj'], 3)))) + theme_classic() + xlab('') + theme(axis.text.x = element_text(size = 8))
+grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, plot7, plot8, plot9, ncol = 3, right = textGrob('log2 counts per million', rot = 90, gp = gpar(fontsize = 10)))
 
 vsd.df$Sex = NULL; vsd.df$Group = NULL; vsd.df = data.frame(t(vsd.df))
 rm(plot); rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(plot5); rm(plot6)
@@ -385,14 +541,8 @@ rm(plot); rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(plot5); rm(plot6)
 ```{r}
 ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
 zzz = t(scale(t(vsd.df[rownames(res.df[1:25, ]), ]))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-Heatmap(zzz, show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), column_title = 'Top DE genes by padj, V0', column_split = meta_data$Group)
+Heatmap(zzz, show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), column_title = 'Top 25 DE genes by padj, V0', column_split = meta_data$Group)
 rm(ha_top); rm(zzz)
-```
-
-```{r, warning = FALSE}
-ggplot(res.df, aes(x = log2FoldChange, y = -log10(padj))) + geom_point() +
-  geom_hline(yintercept = -log10(0.1), linetype = 2) + geom_vline(xintercept = 0, linetype = 2) +
-  theme_classic() + geom_text_repel(data = subset(res.df, -log10(padj) > 1), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name), max.overlaps = 9, position = position_nudge_repel(x = 0.1, y = 0.7)) + ggtitle("Volcano plot of V0 DE genes")
 ```
 
 ```{r}
@@ -406,7 +556,7 @@ ranks <- res.df %>%
 ranks <- deframe(ranks)
 ```
 
-```{r}
+```{r, warning = FALSE}
 msig.df = as.data.frame(msigdbr(species = "Homo sapiens", category = "C8")); msig.df = msig.df[grepl('HAY_BONE_MARROW', msig.df$gs_name), ]
 msigDB = by(msig.df$gene_symbol, msig.df$gs_name, function(x) as.character(x)); names(msigDB) = gsub('HAY_BONE_MARROW_', '', names(msigDB))
 fgseaRes = fgsea(pathways = msigDB, stats = ranks, nproc = 1); fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = FALSE), ]
@@ -418,19 +568,17 @@ ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(p
 plotGseaTable(msigDB[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(3, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
 ```
 
-```{r}
+```{r, warning = FALSE}
 res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
 ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
-plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[1, 'pathway']]]] & log2FoldChange > 0))[1:10], ]
+plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[4, 'pathway']]]] & log2FoldChange > 0))[1:10], ]
 zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot1 = Heatmap(zzz, row_title = fgseaRes[[1, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Platelet, erythroblast, and DC signatures\nare turned up in symptomatics at V0')
-plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[2, 'pathway']]]] & log2FoldChange > 0))[1:10], ]
+plot1 = Heatmap(zzz, row_title = fgseaRes[[4, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Platelet, erythroblast, and DC signatures\nare turned up in symptomatics at V0')
+res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
+plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[5, 'pathway']]]] & log2FoldChange < 0))[1:10], ]
 zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[2, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-plot3 = vsd.df[rownames(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[4, 'pathway']]]] & log2FoldChange > 0))[1:10], ]
-zzz = t(scale(t(plot3))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot3 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[4, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-draw(plot1 %v% plot2 %v% plot3); rm(plot1); rm(plot2); rm(plot3); rm(zzz); rm(ha_top)
+plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[5, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+draw(plot1 %v% plot2); rm(plot1); rm(plot2); rm(zzz); rm(ha_top)
 
 ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[1, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Platelet genes at V0') + geom_vline(xintercept = 0, linetype = 2)
 ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[2, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Erythroblast genes at V0') + geom_vline(xintercept = 0, linetype = 2)
@@ -439,7 +587,7 @@ ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[4, 'pathway']]]]
 ggplot(subset(res.df, external_gene_name %in% msigDB[[fgseaRes[[5, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Neutrophil genes at V0') + geom_vline(xintercept = 0, linetype = 2)
 ```
 
-```{r}
+```{r, warning = FALSE, message = FALSE}
 btm = readRDS('data/Blood_Transcript_modules.RDS'); btm_annot = read_excel('data/btm_annotation_table.xls')
 btm_annot = subset(btm_annot, `Module category` == 'immune'); btm = btm[c(btm_annot$ID)]; names(btm) = btm_annot$`Composite name`
 fgseaRes = fgsea(pathways = btm, stats = ranks, nproc = 1); fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = FALSE), ]
@@ -450,152 +598,32 @@ ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(p
 plotGseaTable(btm[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(6, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
 ```
 
-```{r}
+```{r, warning = FALSE}
 res.df = res.df[order(res.df$log2FoldChange, decreasing = FALSE), ]
 ha_top = HeatmapAnnotation(df = meta_data[, c('Group', 'Sex')], col = list(Group = c('Symptomatic' = 'darkolivegreen4', 'Asymptomatic' = 'darkorchid4'), Sex = c('Male' = 'gold2', 'Female' = 'deepskyblue2')), show_annotation_name = FALSE)
 plot1 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[1, 'pathway']]]] & log2FoldChange < 0))[1:8], ]
 zzz = t(scale(t(plot1))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
 plot1 = Heatmap(zzz, row_title = fgseaRes[[1, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, top_annotation = ha_top, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2), column_title = 'Dendritic and T cells are up,\nneutrophils and TLR signalling are down in symptomatics at V0')
-plot4 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]] & log2FoldChange < 0))[1:8], ]
+plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[5, 'pathway']]]] & log2FoldChange < 0))[1:8], ]
+zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[5, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
+plot3 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[2, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
+zzz = t(scale(t(plot3))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
+plot3 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[2, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
+plot4 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
 zzz = t(scale(t(plot4))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
 plot4 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[3, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-res.df = res.df[order(res.df$log2FoldChange, decreasing = TRUE), ]
-plot2 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[2, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
-zzz = t(scale(t(plot2))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot2 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[2, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-plot3 = vsd.df[rownames(subset(res.df, external_gene_name %in% btm[[fgseaRes[[5, 'pathway']]]] & log2FoldChange > 0))[1:8], ]
-zzz = t(scale(t(plot3))); zzz = pmin(pmax(zzz, -3), 3); rownames(zzz) =  res.df[rownames(zzz), 'external_gene_name']
-plot3 = Heatmap(zzz, show_heatmap_legend = FALSE, row_title = fgseaRes[[5, 'pathway']], show_row_names = TRUE, show_column_names = FALSE, cluster_rows = TRUE, cluster_columns = TRUE, show_row_dend = FALSE, show_column_dend = FALSE, column_split = meta_data$Group, heatmap_legend_param = list(title = "Z-score"), col = colorRamp2(c(-4, -1.25, 0, 1.25, 4), c("darkblue", "cornflowerblue", "gainsboro", "brown1", "firebrick4")), row_names_gp = gpar(fontsize = 7), row_title_rot = 0, row_title_gp = gpar(fontsize = 10), column_title_gp = gpar(fontsize = 11, fontface = 2))
-draw(plot1 %v% plot4 %v% plot2 %v% plot3); rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(ha_top); rm(zzz); rm(ranks)
+draw(plot1 %v% plot2 %v% plot3 %v% plot4); rm(plot1); rm(plot2); rm(plot3); rm(plot4); rm(ha_top); rm(zzz); rm(ranks)
 
 ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[1, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Neutrophil genes at V0') + geom_vline(xintercept = 0, linetype = 2)
-ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[2, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Dendritic cell genes at V0') + geom_vline(xintercept = 0, linetype = 2)
-ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[5, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('T cell genes at V0') + geom_vline(xintercept = 0, linetype = 2)
-ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('TLR signalling genes at V0') + geom_vline(xintercept = 0, linetype = 2)
-```
-
-### 5. Antibodies and T cell responses
-
-```{r}
-antibody_data = read.csv('data/antibodies.csv')
-antibody_data = subset(antibody_data, Patient %in% meta_data$Participant.ID); meta_anti = meta_data[meta_data$Participant.ID %in% antibody_data$Patient, ]; antibody_data$Group = meta_anti$Group; rm(meta_anti)
-```
-
-```{r}
-ggboxplot(antibody_data, x = 'Group', y = 'Titre', add = 'jitter', facet.by = 'Antibody.type') + stat_compare_means(label = "p.format") + xlab('') + ggtitle('COVID antibody titres are not significantly different\nbetween symptomatic and asymptomatic groups at V2B')
-```
-
-```{r}
-tcell_data = read.csv('data/tcells.csv')
-tcell_data = subset(tcell_data, Patient_ID %in% meta_data$Participant.ID); meta_tcell = meta_data[meta_data$Participant.ID %in% tcell_data$Patient_ID, ]; tcell_data$Group = meta_tcell$Group; rm(meta_tcell); tcell_data$Value = log10(tcell_data$Value)
-```
-
-```{r}
-ggboxplot(tcell_data, x = 'Group', y = 'Value', add = 'jitter', facet.by = 'Type') + stat_compare_means(label = "p.format") + xlab('') + ggtitle('T cell responses are not significantly different\nbetween symptomatic and asymptomatic groups at V2B')
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[5, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('TLR genes at V0') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[2, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Resting dendritic cell genes at V0') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[3, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('T cell genes at V0') + geom_vline(xintercept = 0, linetype = 2)
+ggplot(subset(res.df, external_gene_name %in% btm[[fgseaRes[[8, 'pathway']]]]), aes(x = log2FoldChange, y = -log10(padj), label = external_gene_name)) + geom_point() + geom_text_repel() + theme_classic() + ggtitle('Myeloid cell and monocyte genes at V0') + geom_vline(xintercept = 0, linetype = 2)
 ```
 
 
-### 6. Flow cytometry
+### 6. Summary
 
-```{r}
-flow = read.csv('data/COVIRS_flow_data_20230202.csv'); flow = subset(flow, Patient %in% meta_data$Participant.ID & Timepoint == 'V2A'); meta_flow = subset(meta_data, Participant.ID %in% flow$Patient); flow = flow[order(flow$Patient), ]; flow$Group = meta_flow$Group
-```
-
-```{r}
-flow_log = log10(flow[, 5:ncol(flow) - 1]); flow_log$Group = meta_flow$Group
-
-plot1 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[1], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.5) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot2 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[2], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 5.75) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot3 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[3], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 6.1) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot6 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[6], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.7) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot9 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[9], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.5, label.y = 4.6) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot11 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[11], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1.75, label.y = 3.4) + xlab('') + theme(axis.text.x = element_text(size = 8))
-grid.arrange(plot1, plot2, plot3, plot6, plot9, plot11, ncol = 3, top = textGrob('   Flow cytometry results for V2', gp = gpar(fontsize = 16)), right = textGrob('log10 counts                    log10 counts', rot = 90, gp = gpar(fontsize = 11)))
-```
-
-```{r}
-flow = read.csv('data/COVIRS_flow_data_20230202.csv'); flow = subset(flow, Patient %in% meta_data$Participant.ID & Timepoint == 'V0'); meta_flow = subset(meta_data, Participant.ID %in% flow$Patient); flow = flow[order(flow$Patient), ]; flow$Group = meta_flow$Group
-```
-
-```{r}
-flow_log = log10(flow[, 5:ncol(flow) - 1]); flow_log$Group = meta_flow$Group
-
-plot1 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[1], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.6) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot2 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[2], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 6.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot3 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[3], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 6.25) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot5 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[5], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.8) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot9 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[9], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 5.5) + xlab('') + theme(axis.text.x = element_text(size = 8))
-plot11 = ggboxplot(flow_log, x = 'Group', y = colnames(flow_log)[11], add = 'jitter') + stat_compare_means(label = "p.format", label.x = 1, label.y = 4.2) + xlab('') + theme(axis.text.x = element_text(size = 8))
-grid.arrange(plot1, plot2, plot3, plot5, plot9, plot11, ncol = 3, top = textGrob('   Flow cytometry results for V0', gp = gpar(fontsize = 16)), right = textGrob('log10 counts                    log10 counts', rot = 90, gp = gpar(fontsize = 11)))
-```
-
-
-### 7. ATAC-seq
-
-```{r}
-atac = readRDS('data/V0_ATACSeq.RDS'); atac = atac[, colnames(atac) %in% meta_data$Participant.ID]; meta_atac = meta_data[meta_data$Participant.ID %in% colnames(atac), ]; atac = atac[, order(colnames(atac))]
-atac_annot = readRDS('data/ATACSeq_peak_annotation')
-```
-
-```{r}
-meta_atac$COVIRS_ID = meta_atac$id; meta_atac$id = meta_atac$Participant.ID; meta_atac$Participant.ID = NULL; rownames(meta_atac) = NULL; atac = data.frame(cbind(loc = rownames(atac), atac)); rownames(atac) = NULL; atac = data.frame(atac)
-dds = DESeqDataSetFromMatrix(countData = atac, 
-                              colData = meta_atac, 
-                              design = ~ Group + Sex, tidy = TRUE)
-keep = rowSums(counts(dds)>100) >= 4; dds = dds[keep, ]; dds = DESeq(dds)
-res = results(dds, contrast = c("Group", "Symptomatic", "Asymptomatic")); res = res[order(res$padj, decreasing = FALSE), ]
-res; summary(res); res.df = data.frame(res)
-```
-
-```{r}
-res.df = data.frame(cbind(res.df, atac_annot[rownames(res.df), ]))
-ggplot(res.df, aes(x = log2FoldChange, y = -log10(padj), label = SYMBOL)) + geom_point() + geom_text_repel()
-```
-
-```{r}
-ranks <- res.df %>% 
-  as_tibble() %>%
-  dplyr::select(SYMBOL, log2FoldChange) %>% 
-  na.omit() %>% 
-  distinct() %>% 
-  group_by(SYMBOL) %>% 
-  summarize(log2FoldChange=mean(log2FoldChange))
-ranks <- deframe(ranks)
-```
-
-```{r, message = FALSE}
-msig.df = as.data.frame(msigdbr(species = "Homo sapiens", category = "H"))
-msigDB = by(msig.df$gene_symbol, msig.df$gs_name, function(x) as.character(x))
-names(msigDB) = gsub('HALLMARK_', '', names(msigDB))
-fgseaRes = fgsea(pathways = msigDB, stats = ranks, nproc = 1); fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = FALSE), ]
-
-ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(padj), label = size)) +
-  geom_col() + geom_text(color = 'gray20', nudge_x = ifelse(fgseaRes$NES > 0, 0.5, 3)) + 
-  ylab('') + theme_classic()
-plotGseaTable(msigDB[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(3, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
-```
-
-```{r}
-btm = readRDS('data/Blood_Transcript_modules.RDS'); btm_annot = read_excel('data/btm_annotation_table.xls')
-btm_annot = subset(btm_annot, `Module category` == 'immune'); btm = btm[c(btm_annot$ID)]; names(btm) = btm_annot$`Composite name`
-fgseaRes = fgsea(pathways = btm, stats = ranks, nproc = 1); fgseaRes = fgseaRes[order(fgseaRes$padj, decreasing = FALSE), ]
-
-fgseaRes = fgseaRes[pathway %in% subset(btm_annot, `Module category` == 'immune')$`Composite name`, ]
-ggplot(fgseaRes[1:25, ], aes(y = reorder(pathway, NES), x = NES, fill = -log10(padj), label = size)) + geom_col() + geom_text(color = 'gray20', nudge_x = ifelse(fgseaRes$NES > 0, 0.5, 3.5)) + ylab('') + theme_classic()
-plotGseaTable(btm[fgseaRes[1:20, ][, pathway]], ranks, fgseaRes[1:20, ], gseaParam = 0.5, colwidths = c(6, 3, 0.8, 1.2, 1.2), pathwayLabelStyle = list(size = 10), headerLabelStyle = list(size = 10), valueStyle = list(size = 10))
-```
-
-```{r}
-pca = prcomp(data.frame(t(counts(dds, normalized=TRUE))))
-print(summary(pca))
-
-pcaData = as.data.frame(pca$x)
-pcaData$sample=rownames(pcaData)
-pcaData=data.frame(cbind(pcaData, meta_atac))
-percentVar = round(100 * (pca$sdev^2 / sum( pca$sdev^2 ) ))
-p=ggplot(data=pcaData, aes(x = PC1, y = PC2, color = Group)) + geom_point(size=3)
-p=p+xlab(paste0("PC1: ", percentVar[1], "% variance"))
-p=p+ylab(paste0("PC2: ", percentVar[2], "% variance"))
-print(p)
-```
-
+Symptomatic people have more active NK cells (via CNOT7 underexpression and stronger TNFa singalling), lower blood B cell count, and possibly less active neutrophils after the second dose of Pfizer. Prior to vaccination, they have more active dendritic and T cells, and less acive neutrophils, and underexpress RNU1-4.
