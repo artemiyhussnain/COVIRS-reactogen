@@ -1,6 +1,9 @@
 ## COVIRS-reactogen
 Analysis of RNA-seq data (mostly) from participants clustered by symptoms
 
+### Where is the code and the report?
+Please see the summary_report for a quick read, and [this link](https://htmlpreview.github.io/?https://github.com/artemiyhussnain/COVIRS-reactogen/blob/main/report_full.html) to view the html document with all code and plots for technical details. 
+
 ### What is this?
 Ryan et al. published a [study](https://doi.org/10.1101/2022.09.22.22280180) (accepted for publication at the time of writing) that used deep multi-omics data to analyse the immune response to the Pfizer and AstraZeneca COVID vaccines. They collected bulk RNA-seq, flow cytometry, antibody, T cell response, and other data before vaccination and after each vaccine dose.
 
